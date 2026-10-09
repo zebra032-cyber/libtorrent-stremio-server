@@ -1901,6 +1901,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dirs"
+version = "7.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8d57d423b3c82e89b9a24ca3091fee61f456a26edbd28d26c65906f4bc1dcd8f"
+dependencies = [
+ "dirs-sys",
+]
+
+[[package]]
 name = "dirs-sys"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7497,7 +7506,7 @@ dependencies = [
  "crossbeam-channel",
  "crossterm",
  "dashmap",
- "dirs",
+ "dirs 7.0.0",
  "enginefs",
  "flate2",
  "fslock",
@@ -7555,7 +7564,7 @@ version = "0.1.8"
 dependencies = [
  "anyhow",
  "async-trait",
- "dirs",
+ "dirs 7.0.0",
  "open",
  "reqwest 0.13.4",
  "serde",
@@ -8915,7 +8924,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65ba1e5f6b9ef9fd87e21b9c6f351554dbd717960089168fcfdef854686961dc"
 dependencies = [
  "crossbeam-channel",
- "dirs",
+ "dirs 6.0.0",
  "libappindicator",
  "muda",
  "objc2 0.6.4",
