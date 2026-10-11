@@ -137,12 +137,19 @@ pub struct HlsQuery {
     pub media_url: Option<String>,
 }
 
+fn header_user_agent(headers: &axum::http::HeaderMap) -> &str {
+    headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+}
+
 /// Master playlist endpoint using mediaURL query parameter (for Stremio compatibility)
 /// GET /hlsv2/{hash}/master.m3u8?mediaURL=http://127.0.0.1:11470/{infoHash}/{fileIdx}?
 pub async fn master_playlist_by_url(
     State(state): State<AppState>,
     Path(_hash): Path<String>,
-    _headers: axum::http::HeaderMap,
+    headers: axum::http::HeaderMap,
     axum::extract::Query(params): axum::extract::Query<HlsQuery>,
     axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Response {
@@ -192,7 +199,15 @@ pub async fn master_playlist_by_url(
     // Generate master playlist - use the REAL info_hash from mediaURL, not the path hash
     // This ensures subsequent stream/segment requests use the correct torrent identifier
     // Base URL for segments
-    let query_str = raw_query.as_deref().unwrap_or("");
+    let user_agent = header_user_agent(&headers);
+    let query = enginefs::hls::effective_query(raw_query.as_deref().unwrap_or(""), user_agent);
+    let query_str = query.as_str();
+    tracing::info!(
+        "HLS master playlist (mediaURL): muxed_audio={} user_agent={:?} query={:?}",
+        enginefs::hls::wants_muxed_audio(query_str),
+        user_agent,
+        query_str
+    );
 
     let playlist = enginefs::hls::HlsEngine::get_master_playlist(
         &probe,
@@ -216,7 +231,7 @@ pub async fn master_playlist_by_url(
 pub async fn get_master_playlist(
     State(state): State<AppState>,
     Path((info_hash, file_idx)): Path<(String, usize)>,
-    _headers: axum::http::HeaderMap,
+    headers: axum::http::HeaderMap,
     axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Response {
     let request_start = std::time::Instant::now();
@@ -246,7 +261,9 @@ pub async fn get_master_playlist(
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
 
-    let query_str = raw_query.as_deref().unwrap_or("");
+    let user_agent = header_user_agent(&headers);
+    let query = enginefs::hls::effective_query(raw_query.as_deref().unwrap_or(""), user_agent);
+    let query_str = query.as_str();
     let subtitle_tracks = engine.find_subtitle_tracks().await;
 
     let playlist = enginefs::hls::HlsEngine::get_master_playlist(
@@ -259,10 +276,12 @@ pub async fn get_master_playlist(
     );
 
     tracing::info!(
-        "startup: HLS master playlist ready in {:?} (streams={}, subtitles={})",
+        "startup: HLS master playlist ready in {:?} (streams={}, subtitles={}, muxed_audio={}, user_agent={:?})",
         request_start.elapsed(),
         probe.streams.len(),
-        subtitle_tracks.len()
+        subtitle_tracks.len(),
+        enginefs::hls::wants_muxed_audio(query_str),
+        user_agent
     );
 
     (

@@ -37,6 +37,24 @@ pub fn wants_muxed_audio(query_str: &str) -> bool {
         .any(|pair| pair == MUX_AUDIO_QUERY_FLAG)
 }
 
+/// True for a Google Cast receiver (Chromecast), whose browser user agent contains "CrKey".
+pub fn is_cast_receiver(user_agent: &str) -> bool {
+    user_agent.contains("CrKey")
+}
+
+/// The query string playlists should carry. Cast receivers always get muxed audio, even when
+/// the sending app didn't ask for it, because a separate audio rendition plays silently on them.
+/// The flag rides along on every child playlist and segment link, so segments see it too.
+pub fn effective_query(query_str: &str, user_agent: &str) -> String {
+    if wants_muxed_audio(query_str) || !is_cast_receiver(user_agent) {
+        query_str.to_string()
+    } else if query_str.is_empty() {
+        MUX_AUDIO_QUERY_FLAG.to_string()
+    } else {
+        format!("{}&{}", query_str, MUX_AUDIO_QUERY_FLAG)
+    }
+}
+
 /// The audio stream muxed segments carry: the first stream marked default, else the first one.
 /// Returns its global stream index (as used by `-map 0:{index}`).
 pub fn default_audio_stream_index(probe: &ProbeResult) -> Option<usize> {
@@ -1013,6 +1031,21 @@ mod tests {
         assert!(!wants_muxed_audio(""));
         assert!(!wants_muxed_audio("muxAudio=0"));
         assert!(!wants_muxed_audio("xmuxAudio=1"));
+    }
+
+    #[test]
+    fn cast_receivers_always_get_muxed_audio() {
+        let crkey = "Mozilla/5.0 (X11; Linux armv7l) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36 CrKey/1.56.500000 DeviceType/Chromecast";
+        assert_eq!(
+            effective_query("videoCodecs=h264", crkey),
+            "videoCodecs=h264&muxAudio=1"
+        );
+        assert_eq!(effective_query("", crkey), "muxAudio=1");
+        assert_eq!(effective_query("a=1&muxAudio=1", crkey), "a=1&muxAudio=1");
+        assert_eq!(
+            effective_query("videoCodecs=h264", "Safari"),
+            "videoCodecs=h264"
+        );
     }
 
     #[test]
