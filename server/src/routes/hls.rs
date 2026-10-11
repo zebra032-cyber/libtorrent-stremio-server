@@ -447,7 +447,7 @@ async fn get_segment(
     info_hash: String,
     file_idx: usize,
     segment: String,
-    _raw_query: Option<String>,
+    raw_query: Option<String>,
 ) -> Response {
     let request_start = std::time::Instant::now();
     let engine = match state.stream_engine().get_or_add_engine(&info_hash).await {
@@ -535,6 +535,13 @@ async fn get_segment(
         transcode_profile.as_deref(),
     );
     config.is_high_bit_depth = probe.has_high_bit_depth_video();
+    // Cast receivers that can't play a separate audio rendition ask for audio inside the video
+    // segments (see enginefs::hls::MUX_AUDIO_QUERY_FLAG).
+    if audio_track_idx.is_none()
+        && enginefs::hls::wants_muxed_audio(raw_query.as_deref().unwrap_or(""))
+    {
+        config.mux_audio_index = enginefs::hls::default_audio_stream_index(&probe);
+    }
     // Dispatch to video or audio transcoding based on segment type
     let mut child = if let Some(audio_idx) = audio_track_idx {
         // Audio-only segment

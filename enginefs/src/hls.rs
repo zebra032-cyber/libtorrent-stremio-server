@@ -20,6 +20,32 @@ pub struct TranscodeConfig {
     pub gop_frames: u32,                // 96 frames (4s @ 24fps)
     pub hwaccel: Option<HwAccelConfig>, // Hardware acceleration config
     pub is_high_bit_depth: bool,        // Input video has high bit depth (10-bit/12-bit)
+    /// When set, video segments also carry this audio stream (global stream index), converted in
+    /// the same ffmpeg pass. Used for cast receivers that can't play a separate audio rendition.
+    pub mux_audio_index: Option<usize>,
+}
+
+/// Query flag a client sends to get audio muxed into the video segments instead of a separate
+/// HLS audio rendition. Old Chromecasts fetch a separate MPEG-TS audio rendition but play it
+/// silently; muxed segments also keep audio and video in sync because one pass produces both.
+pub const MUX_AUDIO_QUERY_FLAG: &str = "muxAudio=1";
+
+/// True when the request's query string asks for muxed audio.
+pub fn wants_muxed_audio(query_str: &str) -> bool {
+    query_str
+        .split('&')
+        .any(|pair| pair == MUX_AUDIO_QUERY_FLAG)
+}
+
+/// The audio stream muxed segments carry: the first stream marked default, else the first one.
+/// Returns its global stream index (as used by `-map 0:{index}`).
+pub fn default_audio_stream_index(probe: &ProbeResult) -> Option<usize> {
+    let audio = probe.streams.iter().filter(|s| s.codec_type == "audio");
+    audio
+        .clone()
+        .find(|s| s.is_default)
+        .or_else(|| audio.clone().next())
+        .map(|s| s.index)
 }
 
 impl Default for TranscodeConfig {
@@ -31,6 +57,7 @@ impl Default for TranscodeConfig {
             gop_frames: 96,
             hwaccel: None, // Will be set based on transcode_profile
             is_high_bit_depth: false,
+            mux_audio_index: None,
         }
     }
 }
@@ -394,12 +421,17 @@ impl HlsEngine {
             ));
         }
 
-        // Collect audio streams from probe
-        let audio_streams: Vec<&VideoStream> = probe
-            .streams
-            .iter()
-            .filter(|s| s.codec_type == "audio")
-            .collect();
+        // Collect audio streams from probe. With muxed audio the video segments already carry
+        // the audio, so no separate audio rendition is advertised.
+        let audio_streams: Vec<&VideoStream> = if wants_muxed_audio(query_str) {
+            Vec::new()
+        } else {
+            probe
+                .streams
+                .iter()
+                .filter(|s| s.codec_type == "audio")
+                .collect()
+        };
 
         // Generate EXT-X-MEDIA entries for each audio track
         let audio_group_id = "audio";
@@ -597,8 +629,29 @@ impl HlsEngine {
         cmd.args(["-map_metadata", "-1", "-map_chapters", "-1"]);
         cmd.args(["-map", "-0:d?", "-map", "-0:t?"]);
 
-        // Output mapping: video only
-        cmd.args(["-map", "0:v:0", "-an", "-sn"]);
+        // Output mapping: video only, or video + one audio stream when muxing for cast receivers
+        match config.mux_audio_index {
+            Some(audio_index) => {
+                cmd.args(["-map", "0:v:0"]);
+                cmd.arg("-map").arg(format!("0:{}", audio_index));
+                cmd.arg("-sn");
+                // Same audio treatment as the separate audio rendition, minus apad (padding would
+                // stretch this segment past its video).
+                cmd.args([
+                    "-c:a",
+                    "aac",
+                    "-af",
+                    "aresample=async=1:first_pts=0",
+                    "-ac",
+                    "2",
+                    "-b:a",
+                    &config.audio_bitrate,
+                ]);
+            }
+            None => {
+                cmd.args(["-map", "0:v:0", "-an", "-sn"]);
+            }
+        }
 
         // Video encoding: use hardware acceleration if configured, else software fallback
         let is_hw_encoder = config
@@ -924,10 +977,92 @@ mod tests {
 
         let m3u = HlsEngine::get_master_playlist(&probe, "abc123", 2, "", "videoCodecs=h264", &[]);
 
-        assert!(!m3u.contains("127.0.0.1"), "playlist leaked a loopback address:\n{m3u}");
-        assert!(!m3u.contains("http://"), "playlist links must be relative:\n{m3u}");
-        assert!(m3u.contains("URI=\"/hlsv2/abc123/2/audio-1.m3u8?videoCodecs=h264\""), "{m3u}");
-        assert!(m3u.contains("\n/hlsv2/abc123/2/stream-0.m3u8?videoCodecs=h264\n"), "{m3u}");
+        assert!(
+            !m3u.contains("127.0.0.1"),
+            "playlist leaked a loopback address:\n{m3u}"
+        );
+        assert!(
+            !m3u.contains("http://"),
+            "playlist links must be relative:\n{m3u}"
+        );
+        assert!(
+            m3u.contains("URI=\"/hlsv2/abc123/2/audio-1.m3u8?videoCodecs=h264\""),
+            "{m3u}"
+        );
+        assert!(
+            m3u.contains("\n/hlsv2/abc123/2/stream-0.m3u8?videoCodecs=h264\n"),
+            "{m3u}"
+        );
+    }
+
+    fn audio_stream(index: usize, is_default: bool) -> VideoStream {
+        let mut s = video_stream(None, None);
+        s.index = index;
+        s.codec_type = "audio".to_string();
+        s.codec_name = "eac3".to_string();
+        s.is_default = is_default;
+        s
+    }
+
+    #[test]
+    fn muxed_audio_flag_is_an_exact_query_pair() {
+        assert!(wants_muxed_audio("muxAudio=1"));
+        assert!(wants_muxed_audio(
+            "videoCodecs=h264&muxAudio=1&maxAudioChannels=2"
+        ));
+        assert!(!wants_muxed_audio(""));
+        assert!(!wants_muxed_audio("muxAudio=0"));
+        assert!(!wants_muxed_audio("xmuxAudio=1"));
+    }
+
+    #[test]
+    fn default_audio_prefers_the_default_flagged_track() {
+        let probe = ProbeResult {
+            duration: 60.0,
+            container: "matroska".to_string(),
+            streams: vec![
+                video_stream(Some("High"), None),
+                audio_stream(1, false),
+                audio_stream(2, true),
+            ],
+        };
+        assert_eq!(default_audio_stream_index(&probe), Some(2));
+
+        let no_default = ProbeResult {
+            streams: vec![
+                video_stream(None, None),
+                audio_stream(3, false),
+                audio_stream(4, false),
+            ],
+            ..probe.clone()
+        };
+        assert_eq!(default_audio_stream_index(&no_default), Some(3));
+
+        let silent = ProbeResult {
+            streams: vec![video_stream(None, None)],
+            ..probe
+        };
+        assert_eq!(default_audio_stream_index(&silent), None);
+    }
+
+    #[test]
+    fn muxed_master_playlist_has_no_separate_audio_rendition() {
+        let probe = ProbeResult {
+            duration: 60.0,
+            container: "matroska".to_string(),
+            streams: vec![video_stream(Some("High"), None), audio_stream(1, true)],
+        };
+
+        let muxed = HlsEngine::get_master_playlist(&probe, "abc", 0, "", "muxAudio=1", &[]);
+        assert!(!muxed.contains("TYPE=AUDIO"), "{muxed}");
+        assert!(!muxed.contains("AUDIO=\""), "{muxed}");
+        assert!(
+            muxed.contains("/hlsv2/abc/0/stream-0.m3u8?muxAudio=1"),
+            "{muxed}"
+        );
+
+        let separate = HlsEngine::get_master_playlist(&probe, "abc", 0, "", "", &[]);
+        assert!(separate.contains("TYPE=AUDIO"), "{separate}");
     }
 
     #[test]
