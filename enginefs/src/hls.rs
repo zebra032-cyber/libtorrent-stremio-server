@@ -909,6 +909,28 @@ mod tests {
     }
 
     #[test]
+    fn master_playlist_with_empty_base_uses_root_relative_links() {
+        // A Chromecast or phone fetches the master playlist over the LAN; every link inside it
+        // must resolve against that same address, not against the server's own 127.0.0.1.
+        let mut audio = video_stream(None, None);
+        audio.index = 1;
+        audio.codec_type = "audio".to_string();
+        audio.codec_name = "ac3".to_string();
+        let probe = ProbeResult {
+            duration: 60.0,
+            container: "matroska".to_string(),
+            streams: vec![video_stream(Some("High"), Some("yuv420p")), audio],
+        };
+
+        let m3u = HlsEngine::get_master_playlist(&probe, "abc123", 2, "", "videoCodecs=h264", &[]);
+
+        assert!(!m3u.contains("127.0.0.1"), "playlist leaked a loopback address:\n{m3u}");
+        assert!(!m3u.contains("http://"), "playlist links must be relative:\n{m3u}");
+        assert!(m3u.contains("URI=\"/hlsv2/abc123/2/audio-1.m3u8?videoCodecs=h264\""), "{m3u}");
+        assert!(m3u.contains("\n/hlsv2/abc123/2/stream-0.m3u8?videoCodecs=h264\n"), "{m3u}");
+    }
+
+    #[test]
     fn parses_ffmpeg_video_pixel_format() {
         let line = "Stream #0:0: Video: hevc (Main 10), yuv420p10le(tv), 3840x2160, 23.98 fps";
         assert_eq!(

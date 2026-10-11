@@ -25,6 +25,15 @@ fn stremio_format_name(container: &str) -> String {
     }
 }
 
+/// Base written in front of the links inside a master playlist that a *client* fetches.
+///
+/// Empty on purpose, which makes every link root-relative (`/hlsv2/...`), so each client
+/// resolves it against the address it fetched the playlist from. `state.base_url` defaults to
+/// `http://127.0.0.1:11470`, which only works for a player on this same machine: a Chromecast
+/// or phone given those absolute links would try to fetch the stream from itself and fail.
+/// The server's own reads (`hls_stream_url`) keep using `state.base_url`.
+const CLIENT_PLAYLIST_BASE: &str = "";
+
 fn hls_stream_url(base_url: &str, info_hash: &str, file_idx: usize) -> String {
     format!(
         "{}/stream/{}/{}?enginefs-intent=hls",
@@ -189,7 +198,7 @@ pub async fn master_playlist_by_url(
         &probe,
         &info_hash,
         file_idx,
-        &state.base_url,
+        CLIENT_PLAYLIST_BASE,
         query_str,
         &[],
     );
@@ -244,7 +253,7 @@ pub async fn get_master_playlist(
         &probe,
         &info_hash,
         file_idx,
-        &state.base_url,
+        CLIENT_PLAYLIST_BASE,
         query_str,
         &subtitle_tracks,
     );
