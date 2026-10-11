@@ -461,6 +461,13 @@ pub async fn update_settings(state: &AppState, payload: &Value) -> anyhow::Resul
         if let Some(v) = obj.get("cacheRoot")
             && let Some(s) = v.as_str()
         {
+            if settings.cache_root != s {
+                // The torrent engine picks its folder once, at startup (see download_root.rs).
+                tracing::info!(
+                    new_cache_root = %s,
+                    "Cache folder setting changed; restart the server for downloads to use it"
+                );
+            }
             settings.cache_root = s.to_string();
         }
         if let Some(v) = obj.get("proxyStreamsEnabled")

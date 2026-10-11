@@ -46,6 +46,7 @@ pub mod jni;
 mod archives;
 mod cache_cleaner;
 mod diagnostics;
+mod download_root;
 mod ffmpeg_setup;
 mod local_addon;
 mod routes;
@@ -380,6 +381,10 @@ async fn run_inner(
     };
 
     let settings = AppState::load_settings(&config_dir, &default_settings);
+    // Torrent downloads go to the saved cache folder (cacheRoot) when one is set and usable;
+    // before this, the engine always used the default per-user cache and ignored the setting.
+    let download_root =
+        download_root::resolve(cfg.cache_dir.is_some(), &cache_dir, &settings.cache_root).await;
     let settings_arc = Arc::new(tokio::sync::RwLock::new(settings.clone()));
     let settings_path = config_dir.join("settings.json");
     let tracker_storage = Arc::new(state::TrackerStorageBridge::new(
@@ -432,7 +437,7 @@ async fn run_inner(
     };
 
     let (download_engine, download_engine_disk_backed) = match EngineFS::new_disk_backed(
-        cache_dir.clone(),
+        download_root.clone(),
         backend_config.clone(),
         Some(tracker_storage.clone()),
     )
@@ -445,7 +450,7 @@ async fn run_inner(
                 "Disk-backed download engine unavailable at startup; download=1 will use memory-only mode"
             );
             let engine_fs = EngineFS::new_with_storage(
-                cache_dir.clone(),
+                download_root.clone(),
                 backend_config,
                 Some(tracker_storage),
             )
