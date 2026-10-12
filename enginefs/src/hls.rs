@@ -55,6 +55,123 @@ pub fn effective_query(query_str: &str, user_agent: &str) -> String {
     }
 }
 
+/// Sample rate muxed (cast) audio is encoded at, so segment boundaries land on exact samples.
+const MUX_AUDIO_SAMPLE_RATE: i64 = 48_000;
+/// Samples per AAC-LC frame.
+const AAC_FRAME: i64 = 1024;
+/// Whole AAC frames encoded before and after a segment's share of the audio, then dropped,
+/// so the frames that are kept were encoded with real audio on both sides (clean joins).
+const MUX_AUDIO_PREROLL_FRAMES: i64 = 2;
+const MUX_AUDIO_LOOKAHEAD_FRAMES: i64 = 2;
+
+/// How one HLS segment cuts its muxed audio.
+///
+/// Every segment used to carry slightly more than its own share of audio: each one re-encoded
+/// AAC from scratch, adding the encoder's 1024-sample lead-in and padding the end to a whole
+/// frame (about 4.03 s of audio per 4 s segment). Cast receivers play segment audio back to back,
+/// so the sound fell further behind the picture with every segment (about 1 s every 2-3 min).
+///
+/// Instead the timeline is split on the global AAC frame grid: segment k owns frames
+/// [ceil(start*48000/1024), ceil(end*48000/1024)). Neighbouring segments therefore share no
+/// audio and leave no gap, and the sum of all segments is exactly the film's length. The encoder
+/// is fed a little extra audio on both sides (pre-roll/look-ahead) and the surplus packets,
+/// including the lead-in, are dropped after encoding with the `noise` bitstream filter.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MuxedAudioPlan {
+    /// Video filter replacing the output `-ss`/`-t` (which would also cut the audio).
+    pub video_trim: String,
+    /// Audio filter: resample, cut the fed range on exact samples, stamp exact timestamps.
+    pub audio_filter: String,
+    /// `noise` bitstream filter dropping packets outside this segment's frames.
+    pub drop_bsf: String,
+}
+
+impl MuxedAudioPlan {
+    /// `input_seek` is the fast seek applied before `-i`; `start`/`duration` are the segment's.
+    pub fn new(start: f64, duration: f64, input_seek: f64) -> Self {
+        let sr = MUX_AUDIO_SAMPLE_RATE;
+        let to_samples = |t: f64| (t * sr as f64).round() as i64;
+        let first_frame_at = |t: f64| (to_samples(t) + AAC_FRAME - 1).div_euclid(AAC_FRAME);
+
+        let start_s = to_samples(start);
+        let input_s = to_samples(input_seek);
+        let first = first_frame_at(start);
+        let end = first_frame_at(start + duration);
+
+        // Global sample range fed to the encoder (frame aligned, so every segment's encoder
+        // uses the same frame grid).
+        let feed_start = (first - MUX_AUDIO_PREROLL_FRAMES).max(0) * AAC_FRAME;
+        let feed_end = (end + MUX_AUDIO_LOOKAHEAD_FRAMES) * AAC_FRAME;
+
+        // Packet timestamps are in samples relative to the segment start (before
+        // -output_ts_offset). Keep [first, end) frames; half-frame tolerance absorbs rounding.
+        let keep_from = first * AAC_FRAME - start_s;
+        let keep_until = end * AAC_FRAME - start_s;
+        let half = AAC_FRAME / 2;
+
+        let output_seek = start - input_seek;
+        let video_trim = if output_seek > 0.0 {
+            format!(
+                "trim=start={:.6}:duration={:.6},setpts=PTS-STARTPTS",
+                output_seek, duration
+            )
+        } else {
+            format!("trim=duration={:.6},setpts=PTS-STARTPTS", duration)
+        };
+
+        let audio_filter = format!(
+            "aresample={sr}:async=1:first_pts=0,atrim=start_sample={}:end_sample={},asettb=1/{sr},asetpts=N+({})",
+            feed_start - input_s,
+            feed_end - input_s,
+            feed_start - start_s,
+        );
+
+        let drop_bsf = format!(
+            "noise=drop='lt(pts\\,{})+gte(pts\\,{})'",
+            keep_from - half,
+            keep_until - half
+        );
+
+        Self {
+            video_trim,
+            audio_filter,
+            drop_bsf,
+        }
+    }
+}
+
+/// Whether this ffmpeg's `noise` bitstream filter can drop packets by expression (FFmpeg 6+).
+/// Checked once; without it muxed segments fall back to the old cut, which drifts on casts.
+fn ffmpeg_can_drop_packets() -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        let mut cmd = std::process::Command::new("ffmpeg");
+        cmd.args(["-hide_banner", "-h", "bsf=noise"]);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        let supported = cmd
+            .output()
+            .map(|out| {
+                let text = String::from_utf8_lossy(&out.stdout);
+                text.lines()
+                    .any(|l| l.trim_start().starts_with("-drop ") && l.contains("<string>"))
+            })
+            .unwrap_or(false);
+        if supported {
+            tracing::info!("Cast audio: exact per-segment audio enabled (ffmpeg noise drop supported)");
+        } else {
+            tracing::warn!(
+                "Cast audio: this ffmpeg can't drop packets by expression (needs FFmpeg 6 or newer); \
+                 cast audio will slowly drift. Update ffmpeg to fix it."
+            );
+        }
+        supported
+    })
+}
+
 /// The audio stream muxed segments carry: the first stream marked default, else the first one.
 /// Returns its global stream index (as used by `-map 0:{index}`).
 pub fn default_audio_stream_index(probe: &ProbeResult) -> Option<usize> {
@@ -626,17 +743,35 @@ impl HlsEngine {
 
         cmd.arg("-i").arg(input_path);
 
-        // Output seeking (accurate, slower) - AFTER -i
-        // This decodes from the input seek point and discards until exact target
-        if output_seek > 0.0 {
-            cmd.arg("-ss").arg(format!("{:.3}", output_seek));
+        // Muxed (cast) audio is cut on exact AAC frames with per-stream filters instead of the
+        // output -ss/-t, which apply to every stream at once. See MuxedAudioPlan.
+        let muxed_plan = match config.mux_audio_index {
+            Some(_) if ffmpeg_can_drop_packets() => {
+                Some(MuxedAudioPlan::new(start, duration, input_seek))
+            }
+            _ => None,
+        };
+
+        if muxed_plan.is_none() {
+            // Output seeking (accurate, slower) - AFTER -i
+            // This decodes from the input seek point and discards until exact target
+            if output_seek > 0.0 {
+                cmd.arg("-ss").arg(format!("{:.3}", output_seek));
+            }
         }
 
         // Output timestamp offset - sets segment timestamps correctly
         cmd.arg("-output_ts_offset").arg(format!("{:.3}", start));
 
-        // Duration limit (CRITICAL: prevent transcoding entire file)
-        cmd.arg("-t").arg(format!("{:.3}", duration));
+        // Duration limit (CRITICAL: prevent transcoding entire file). With a muxed plan the
+        // filters cut each stream exactly; this stays as a safety stop with a little headroom
+        // for the audio look-ahead.
+        let output_limit = if muxed_plan.is_some() {
+            duration + 1.0
+        } else {
+            duration
+        };
+        cmd.arg("-t").arg(format!("{:.3}", output_limit));
 
         let threads = video_thread_count(config);
         cmd.args(["-threads", &threads]);
@@ -655,16 +790,25 @@ impl HlsEngine {
                 cmd.arg("-sn");
                 // Same audio treatment as the separate audio rendition, minus apad (padding would
                 // stretch this segment past its video).
-                cmd.args([
-                    "-c:a",
-                    "aac",
-                    "-af",
-                    "aresample=async=1:first_pts=0",
-                    "-ac",
-                    "2",
-                    "-b:a",
-                    &config.audio_bitrate,
-                ]);
+                match muxed_plan {
+                    Some(ref plan) => {
+                        cmd.args(["-c:a", "aac", "-af", &plan.audio_filter]);
+                        cmd.args(["-ar", "48000", "-ac", "2", "-b:a", &config.audio_bitrate]);
+                        cmd.args(["-bsf:a", &plan.drop_bsf]);
+                    }
+                    None => {
+                        cmd.args([
+                            "-c:a",
+                            "aac",
+                            "-af",
+                            "aresample=async=1:first_pts=0",
+                            "-ac",
+                            "2",
+                            "-b:a",
+                            &config.audio_bitrate,
+                        ]);
+                    }
+                }
             }
             None => {
                 cmd.args(["-map", "0:v:0", "-an", "-sn"]);
@@ -690,7 +834,7 @@ impl HlsEngine {
             // For software encoders, add video filter and profile settings
             if !hw.is_hardware() {
                 let pix_fmt = hw.pix_fmt.as_deref().unwrap_or("yuv420p");
-                let filter = software_video_filter(pix_fmt);
+                let filter = with_video_trim(&muxed_plan, software_video_filter(pix_fmt));
                 cmd.arg("-vf").arg(&filter);
                 cmd.args(["-profile:v", "high", "-level", "51"]);
                 tracing::info!(
@@ -699,6 +843,9 @@ impl HlsEngine {
                     "Configured low-impact software HLS video transcode"
                 );
             } else {
+                if let Some(ref plan) = muxed_plan {
+                    cmd.arg("-vf").arg(&plan.video_trim);
+                }
                 // Hardware encoder: force a compatible 8-bit format for high bit depth inputs
                 if config.is_high_bit_depth {
                     let pix_fmt = hw.pix_fmt.as_deref().unwrap_or("nv12");
@@ -709,7 +856,7 @@ impl HlsEngine {
             }
         } else {
             // Default software encoding fallback
-            let filter = software_video_filter("yuv420p");
+            let filter = with_video_trim(&muxed_plan, software_video_filter("yuv420p"));
             cmd.arg("-vf").arg(&filter);
             cmd.args([
                 "-c:v",
@@ -902,6 +1049,14 @@ fn video_thread_count(config: &TranscodeConfig) -> String {
     threads.to_string()
 }
 
+/// Prepend a muxed plan's exact video cut to a video filter chain.
+fn with_video_trim(plan: &Option<MuxedAudioPlan>, filter: String) -> String {
+    match plan {
+        Some(plan) => format!("{},{}", plan.video_trim, filter),
+        None => filter,
+    }
+}
+
 fn software_video_filter(pix_fmt: &str) -> String {
     format!("scale=w='min(1920,iw)':h=-2:flags=fast_bilinear,format={pix_fmt}")
 }
@@ -1031,6 +1186,51 @@ mod tests {
         assert!(!wants_muxed_audio(""));
         assert!(!wants_muxed_audio("muxAudio=0"));
         assert!(!wants_muxed_audio("xmuxAudio=1"));
+    }
+
+    #[test]
+    fn muxed_audio_segments_tile_the_aac_frame_grid() {
+        // Segment 1 (4s-8s), no input seek: owns frames [188, 375); fed from frame 186 to 377.
+        let plan = MuxedAudioPlan::new(4.0, 4.0, 0.0);
+        assert_eq!(
+            plan.video_trim,
+            "trim=start=4.000000:duration=4.000000,setpts=PTS-STARTPTS"
+        );
+        assert_eq!(
+            plan.audio_filter,
+            "aresample=48000:async=1:first_pts=0,atrim=start_sample=190464:end_sample=386048,asettb=1/48000,asetpts=N+(-1536)"
+        );
+        assert_eq!(plan.drop_bsf, "noise=drop='lt(pts\\,0)+gte(pts\\,191488)'");
+
+        // Segment 0 cannot pre-roll before the start; it drops only the encoder lead-in.
+        let first = MuxedAudioPlan::new(0.0, 4.0, 0.0);
+        assert_eq!(
+            first.video_trim,
+            "trim=duration=4.000000,setpts=PTS-STARTPTS"
+        );
+        assert!(
+            first
+                .audio_filter
+                .contains("atrim=start_sample=0:end_sample=194560")
+        );
+        assert_eq!(
+            first.drop_bsf,
+            "noise=drop='lt(pts\\,-512)+gte(pts\\,192000)'"
+        );
+
+        // With a fast input seek, sample positions are relative to the seek point.
+        let later = MuxedAudioPlan::new(184.0, 4.0, 174.0);
+        assert_eq!(
+            later.video_trim,
+            "trim=start=10.000000:duration=4.000000,setpts=PTS-STARTPTS"
+        );
+        // Frames [8625, 8813): fed from frame 8623 to 8815, minus the 174 s input seek.
+        assert!(
+            later
+                .audio_filter
+                .contains("atrim=start_sample=477952:end_sample=674560")
+        );
+        assert!(later.audio_filter.ends_with("asetpts=N+(-2048)"));
     }
 
     #[test]
