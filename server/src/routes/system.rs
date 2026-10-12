@@ -856,61 +856,160 @@ pub async fn get_https(
         }
     };
 
-    // Parity with http_client_804.js: parse certificate response
-    let result = &json["result"];
-    if result.is_null() {
-        return (StatusCode::NOT_FOUND, "No certificate found in response").into_response();
-    }
-
-    let cert_data_str = match result["certificate"].as_str() {
-        Some(s) => s,
-        None => return (StatusCode::NOT_FOUND, "Certificate field missing").into_response(),
+    let issued = match parse_certificate_reply(&json) {
+        Ok(issued) => issued,
+        Err(reason) => {
+            tracing::warn!(reason = %reason, "Stremio certificate reply could not be used");
+            return (StatusCode::BAD_GATEWAY, reason).into_response();
+        }
     };
 
-    let cert_data: serde_json::Value = match serde_json::from_str(cert_data_str) {
-        Ok(v) => v,
-        Err(_) => {
+    let cert_path = state.config_dir.join("https-cert.pem");
+    let key_path = state.config_dir.join("https-key.pem");
+    for (path, contents) in [(&cert_path, &issued.cert_pem), (&key_path, &issued.key_pem)] {
+        if let Err(e) = tokio::fs::write(path, contents).await {
+            tracing::error!("Failed to write {:?}: {}", path, e);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to parse inner certificate JSON",
+                format!("Failed to save certificate: {}", e),
             )
                 .into_response();
         }
-    };
-
-    // Save to disk for main.rs HTTPS listener
-    if let (Some(cert), Some(key)) = (
-        cert_data["certificate"].as_str(),
-        cert_data["privateKey"].as_str(),
-    ) {
-        let cert_path = state.config_dir.join("https-cert.pem");
-        let key_path = state.config_dir.join("https-key.pem");
-
-        if let Err(e) = tokio::fs::write(&cert_path, cert).await {
-            tracing::error!("Failed to write https-cert.pem: {}", e);
-        }
-        if let Err(e) = tokio::fs::write(&key_path, key).await {
-            tracing::error!("Failed to write https-key.pem: {}", e);
-        }
-        tracing::info!("Saved HTTPS certificates to {:?}", state.config_dir);
     }
-
-    let domain = format!(
-        "{}-{}",
-        ip_address.replace(".", "-"),
-        cert_data["commonName"]
-            .as_str()
-            .unwrap_or("")
-            .replace("*", "")
+    tracing::info!(
+        common_name = %issued.common_name,
+        "Saved HTTPS certificates to {:?}; restart the server to start HTTPS on port {}",
+        state.config_dir,
+        crate::DEFAULT_HTTPS_PORT
     );
 
-    // We should save this to disk, but for the API response:
+    // The certificate is a wildcard for "*.<id>.stremio.rocks", so the LAN address is the IP with
+    // dashes as the first label: "192-168-0-103.<id>.stremio.rocks". It is served by the HTTPS
+    // listener (12470), not the plain-HTTP port, and that listener starts when the server next
+    // launches with the saved certificate.
+    let domain = format!(
+        "{}.{}",
+        ip_address.replace('.', "-"),
+        issued.common_name.trim_start_matches("*.")
+    );
+
     Json(json!({
         "ipAddress": ip_address,
         "domain": domain,
-        "port": state.http_addr.port()
+        "port": crate::DEFAULT_HTTPS_PORT
     }))
     .into_response()
+}
+
+/// A certificate issued by Stremio's API for LAN HTTPS (`*.<id>.stremio.rocks`).
+#[derive(Debug, PartialEq)]
+struct IssuedCertificate {
+    cert_pem: String,
+    key_pem: String,
+    common_name: String,
+}
+
+/// Pull the certificate chain, private key and common name out of an `api/certificateGet`
+/// reply. Two shapes are in use:
+///   current: result.certificate is a JSON string of
+///            {"commonName", "contents": {"Pem", "PrivateKey", "Certificate"}} with base64 PEMs
+///   older:   result is {"certificate": "<PEM>", "privateKey": "<PEM>", "commonName"}
+/// The current shape used to be missed entirely: nothing was saved, so HTTPS never started.
+fn parse_certificate_reply(reply: &Value) -> Result<IssuedCertificate, String> {
+    let mut result = reply.get("result").cloned().unwrap_or(Value::Null);
+    if let Some(text) = result.as_str() {
+        // Some replies double-encode the result object.
+        result =
+            serde_json::from_str(text).map_err(|_| "Certificate reply is not JSON".to_string())?;
+    }
+    if result.is_null() {
+        return Err("No certificate in Stremio's reply (is the account signed in?)".to_string());
+    }
+
+    let certificate = result
+        .get("certificate")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let (cert, key, common_name) = if certificate.starts_with('{') {
+        let inner: Value = serde_json::from_str(certificate)
+            .map_err(|_| "Failed to parse inner certificate JSON".to_string())?;
+        let contents = inner.get("contents");
+        let field = |name: &str| {
+            contents
+                .and_then(|c| c.get(name))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+        };
+        let chain = if field("Pem").is_empty() {
+            field("Certificate")
+        } else {
+            field("Pem")
+        };
+        // Inner JSON from older servers may also carry plain fields.
+        let chain = if chain.is_empty() {
+            inner
+                .get("certificate")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+        } else {
+            chain
+        };
+        let key = if field("PrivateKey").is_empty() {
+            inner
+                .get("privateKey")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+        } else {
+            field("PrivateKey")
+        };
+        let common_name = inner
+            .get("commonName")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        (decode_pem(chain), decode_pem(key), common_name.to_string())
+    } else {
+        let key = result
+            .get("privateKey")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let common_name = result
+            .get("commonName")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        (
+            decode_pem(certificate),
+            decode_pem(key),
+            common_name.to_string(),
+        )
+    };
+
+    if !cert.contains("-----BEGIN CERTIFICATE") {
+        return Err("Certificate missing from Stremio's reply".to_string());
+    }
+    if !key.contains("PRIVATE KEY") {
+        return Err("Private key missing from Stremio's reply".to_string());
+    }
+    Ok(IssuedCertificate {
+        cert_pem: cert,
+        key_pem: key,
+        common_name,
+    })
+}
+
+/// PEM text as-is, or base64-encoded PEM decoded.
+fn decode_pem(field: &str) -> String {
+    use base64::Engine;
+    let field = field.trim();
+    if field.is_empty() || field.starts_with("-----BEGIN") {
+        return field.to_string();
+    }
+    let compact: String = field.chars().filter(|c| !c.is_whitespace()).collect();
+    base64::engine::general_purpose::STANDARD
+        .decode(compact)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .unwrap_or_else(|| field.to_string())
 }
 
 pub async fn get_samples(
@@ -1039,5 +1138,56 @@ mod tests {
     fn server_version_default_uses_crate_version() {
         let settings = ServerSettings::default();
         assert_eq!(settings.server_version, env!("CARGO_PKG_VERSION"));
+    }
+}
+
+#[cfg(test)]
+mod certificate_reply_tests {
+    use super::*;
+    use base64::Engine;
+
+    const CERT: &str = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
+    const KEY: &str = "-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----\n";
+
+    fn b64(s: &str) -> String {
+        base64::engine::general_purpose::STANDARD.encode(s)
+    }
+
+    #[test]
+    fn reads_the_current_nested_base64_reply() {
+        let inner = json!({
+            "commonName": "*.519b6502d940.stremio.rocks",
+            "contents": { "Pem": b64(CERT), "PrivateKey": b64(KEY), "Certificate": b64(CERT) }
+        });
+        let reply = json!({ "result": { "certificate": inner.to_string() } });
+        let issued = parse_certificate_reply(&reply).unwrap();
+        assert_eq!(issued.cert_pem.trim(), CERT.trim());
+        assert_eq!(issued.key_pem.trim(), KEY.trim());
+        assert_eq!(issued.common_name, "*.519b6502d940.stremio.rocks");
+    }
+
+    #[test]
+    fn reads_the_older_flat_pem_reply() {
+        let reply = json!({ "result": {
+            "certificate": CERT, "privateKey": KEY, "commonName": "*.x.stremio.rocks"
+        }});
+        let issued = parse_certificate_reply(&reply).unwrap();
+        assert_eq!(issued.cert_pem.trim(), CERT.trim());
+        assert_eq!(issued.key_pem.trim(), KEY.trim());
+    }
+
+    #[test]
+    fn reads_a_double_encoded_result() {
+        let result = json!({ "certificate": CERT, "privateKey": KEY, "commonName": "*.x" });
+        let reply = json!({ "result": result.to_string() });
+        assert!(parse_certificate_reply(&reply).is_ok());
+    }
+
+    #[test]
+    fn reports_missing_parts_instead_of_silently_succeeding() {
+        assert!(parse_certificate_reply(&json!({ "result": null })).is_err());
+        let no_key = json!({ "result": { "certificate":
+            json!({ "commonName": "*.x", "contents": { "Pem": b64(CERT) } }).to_string() } });
+        assert!(parse_certificate_reply(&no_key).is_err());
     }
 }
